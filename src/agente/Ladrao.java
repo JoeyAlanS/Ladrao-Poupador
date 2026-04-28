@@ -565,12 +565,135 @@ public class Ladrao extends ProgramaLadrao {
     }
 
     /**
-     * Decide a próxima ação do Ladrão baseando-se em sua situação.
-     * Prioridade de decisão:
-     * 1. Se o Poupador é visível E não está em cooldown: PERSEGUIR
-     * 2. Se o cheiro do Poupador é detectado: RASTREAR (seguir o cheiro mais forte)
-     * 3. Senão: EXPLORAR (buscar novos territórios)
-     * Este método é o córao da IA do Ladrão, orquestrando seu comportamento.
+     * Classe auxiliar para armazenar scores calculados para cada ação.
+     * Facilita o cálculo e normalização de probabilidades dinâmicas.
+     */
+    private class ActionScores {
+        double perseguir;
+        double rastrear;
+        double explorar;
+
+        ActionScores(double perseguir, double rastrear, double explorar) {
+            this.perseguir = perseguir;
+            this.rastrear = rastrear;
+            this.explorar = explorar;
+        }
+
+        // Normaliza os scores para probabilidades (soma = 1.0)
+        double[] normalize() {
+            double total = perseguir + rastrear + explorar;
+            if (total == 0) {
+                // Se todos são zero, distribuição uniforme
+                return new double[]{0.33, 0.33, 0.34};
+            }
+            return new double[]{
+                    perseguir / total,
+                    rastrear / total,
+                    explorar / total
+            };
+        }
+    }
+
+    /**
+     * Calcula scores dinâmicos para cada ação baseado na situação atual.
+     * Os scores variam conforme:
+     * - Qualidade do alvo visível (sem cooldown)
+     * - Força do olfato detectado
+     * - Quantidade de áreas inexploradas
+     * - Distância do Ladrão até cada tipo de objetivo
+     *
+     * @param visibleTarget Array com posição do alvo visível, ou null se nenhum
+     * @param hasSmell true se há cheiro detectado
+     * @param hasUnknownArea true se há áreas desconhecidas próximas
+     * @return ActionScores com pontuações para cada ação
+     */
+    private ActionScores calculateActionScores(int[] visibleTarget, boolean hasSmell, boolean hasUnknownArea) {
+        double scorePerseguir = 0.0;
+        double scoreRastrear = 0.0;
+        double scoreExplorar = 0.0;
+
+        // FATOR 1: QUALIDADE DO ALVO VISÍVEL
+        if (visibleTarget != null) {
+            // Alvo visível sem cooldown é EXCELENTE
+            scorePerseguir += 3.0;  // Score base muito alto
+
+            // Proximidade do alvo aumenta score ainda mais
+            int distanceToTarget = HScore.calculateManhattanDistance(
+                    this.getCurrentPosition(),
+                    visibleTarget
+            );
+            // Quanto mais próximo, maior o bonus (máximo 2 pontos)
+            double proximityBonus = Math.max(0, 2.0 - (distanceToTarget * 0.1));
+            scorePerseguir += proximityBonus;
+        }
+
+        // FATOR 2: QUALIDADE DO OLFATO
+        if (hasSmell) {
+            // Olfato detectado é bem atrativo
+            scoreRastrear += 2.5;
+
+            // Se também há alvo visível, olfato recebe boost (decisão mais complexa)
+            if (visibleTarget != null) {
+                scoreRastrear += 0.5;  // Confusão entre duas opções
+            } else {
+                // Se SÓ há olfato, é a melhor opção
+                scoreRastrear += 0.5;
+            }
+        }
+
+        // FATOR 3: EXPLORAÇÃO - QUANTIDADE DE ÁREA DESCONHECIDA
+        if (hasUnknownArea) {
+            scoreExplorar += 2.0;  // Área inexplorada é atrativa
+        }
+
+        // FATOR 4: DIVERSIDADE - Se nada é atrativo, valoriza exploração
+        if (scorePerseguir == 0 && scoreRastrear == 0 && scoreExplorar == 0) {
+            scoreExplorar = 1.5;  // Exploração é o padrão
+            scorePerseguir = 0.5;  // Mas ainda há chance de tentar algo arriscado
+            scoreRastrear = 0.5;
+        }
+
+        // FATOR 5: BALANCEAMENTO - Evita que um score seja absolutamente dominante
+        // (adiciona variância comportamental)
+        if (scorePerseguir > scoreRastrear + scoreExplorar) {
+            // Se perseguir é MUITO melhor, reduz sua dominância em 10%
+            scorePerseguir *= 0.9;
+            scoreRastrear += 0.3;
+            scoreExplorar += 0.3;
+        }
+
+        return new ActionScores(scorePerseguir, scoreRastrear, scoreExplorar);
+    }
+
+    /**
+     * Executa o algoritmo de "roulette wheel" para seleção probabilística.
+     * Dado um valor aleatório entre 0 e 1, retorna qual ação foi escolhida
+     * baseado nos scores normalizados.
+     *
+     * @param actionRoll Valor aleatório entre 0.0 e 1.0
+     * @param probabilities Array com [probPerseguir, probRastrear, probExplorar]
+     * @return 0 para perseguir, 1 para rastrear, 2 para explorar
+     */
+    private int rouletteWheelSelection(double actionRoll, double[] probabilities) {
+        if (actionRoll < probabilities[0]) {
+            return 0;  // PERSEGUIR
+        } else if (actionRoll < probabilities[0] + probabilities[1]) {
+            return 1;  // RASTREAR
+        } else {
+            return 2;  // EXPLORAR
+        }
+    }
+
+    /**
+     * Decide a próxima ação do Ladrão com sistema de scoring dinâmico.
+     * Cada ação ganha pontos baseado na situação real (sem ordem rígida).
+     * 
+     * Sistema de scoring:
+     * - Perseguir: Alvo visível sem cooldown (3.0 base) + proximidade
+     * - Rastrear: Cheiro detectado (2.5 base) + complexidade
+     * - Explorar: Área desconhecida (2.0 base) + diversidade
+     * 
+     * A ação com maior score é escolhida via roulette wheel probabilístico.
      *
      * @return O código de direção do movimento a executar (1-4 ou 0 para parado).
      */
@@ -580,69 +703,139 @@ public class Ladrao extends ProgramaLadrao {
         int thiefX = positions[0];
         int thiefY = positions[1];
 
-        // PRIORIDADE 1: Se Poupador é visível, tenta persegui-lo (se não há cooldown).
+        // Gerador de aleatoriedade para seleção via roulette wheel.
+        Random actionSelector = new Random();
+        double actionRoll = actionSelector.nextDouble();
+
+        // Identifica qual Poupador visível está sem cooldown.
+        int[] visibleTarget = null;
         if (this.isTargetVisible()) {
-            // Procura em toda a área 5x5 visível pelo Poupador sem cooldown.
             for (int y = thiefY - 2; y <= thiefY + 2; y++) {
                 for (int x = thiefX - 2; x <= thiefX + 2; x++) {
+                    if (0 <= x && x <= 29 && 0 <= y && y <= 29) {
+                        if ((this.knownField[y][x] == 100 && this.targetRefreshRate.get(100) == 0) ||
+                            (this.knownField[y][x] == 110 && this.targetRefreshRate.get(110) == 0)) {
+                            visibleTarget = new int[]{x, y};
+                            break;
+                        }
+                    }
+                }
+                if (visibleTarget != null) break;
+            }
+        }
+
+        // Coleta situação atual
+        boolean hasSmell = this.isTargetDetectedBySmell();
+        boolean hasUnknownArea = this.hasUnknownAreasNearby();
+
+        // CALCULA SCORES DINÂMICOS
+        ActionScores scores = this.calculateActionScores(visibleTarget, hasSmell, hasUnknownArea);
+
+        // NORMALIZA PARA PROBABILIDADES
+        double[] probabilities = scores.normalize();
+
+        // ROULETTE WHEEL: Escolhe ação baseado em probabilidades
+        int chosenAction = this.rouletteWheelSelection(actionRoll, probabilities);
+
+        // EXECUTA A AÇÃO ESCOLHIDA (com fallbacks)
+        switch (chosenAction) {
+            case 0:  // PERSEGUIR
+                if (visibleTarget != null) {
+                    return this.chaseTarget(visibleTarget);
+                }
+                // Fallback: tenta rastrear
+                if (hasSmell) {
+                    return this.trackBySmell(thiefX, thiefY);
+                }
+                // Fallback: explora
+                return this.exploreEnvironment();
+
+            case 1:  // RASTREAR
+                if (hasSmell) {
+                    return this.trackBySmell(thiefX, thiefY);
+                }
+                // Fallback: tenta perseguir
+                if (visibleTarget != null) {
+                    return this.chaseTarget(visibleTarget);
+                }
+                // Fallback: explora
+                return this.exploreEnvironment();
+
+            default:  // EXPLORAR (sempre possível)
+                return this.exploreEnvironment();
+        }
+    }
+
+    /**
+     * Método auxiliar para rastrear um Poupador pelo olfato.
+     * Encontra a posição com o melhor cheiro na área 3x3 ao redor do Ladrão.
+     * Este método é utilizado pelo sistema de scoring para seguir pistas.
+     *
+     * @param thiefX Coordenada X atual do Ladrão.
+     * @param thiefY Coordenada Y atual do Ladrão.
+     * @return O código de direção em direção ao melhor cheiro detectado.
+     */
+    private int trackBySmell(int thiefX, int thiefY) {
+        // Obtém array 3x3 com intensidades de cheiro detectadas.
+        int[] saverSmell = this.getSmellSensor();
+        // Índice atual ao iterar sobre o array de cheiro.
+        int saverSmellIndex = 0;
+        // Melhor cheiro detectado (menor valor indica mais próximo).
+        int minSaverSmell = Integer.MAX_VALUE;
+        // Coordenadas da posição com melhor cheiro.
+        int[] minSmellPosition = null;
+
+        // Procura sobre a área 3x3 de olfato ao redor da posição.
+        for (int y = thiefY - 1; y <= thiefY + 1; y++) {
+            for (int x = thiefX - 1; x <= thiefX + 1; x++) {
+                // Pula a posição central (Ladrão não cheira a si mesmo).
+                if (!(x == thiefX && y == thiefY)) {
                     // Valida coordenadas dentro do labirinto.
                     if (0 <= x && x <= 29) {
                         if (0 <= y && y <= 29) {
-                            // Se há Poupador 100 e cooldown expirou (== 0), persegue-o.
-                            if (this.knownField[y][x] == 100 && this.targetRefreshRate.get(100) == 0) {
-                                // Inicia perseguição e retorna movimento.
-                                return this.chaseTarget(new int[]{x, y});
-                            } 
-                            // Se há Poupador 110 e cooldown expirou (== 0), persegue-o.
-                            else if (this.knownField[y][x] == 110 && this.targetRefreshRate.get(110) == 0) {
-                                // Inicia perseguição e retorna movimento.
-                                return this.chaseTarget(new int[]{x, y});
+                            // Se cheiro é melhor (menor/mais forte) e válido (> 0).
+                            if (saverSmell[saverSmellIndex] <= minSaverSmell
+                                    && !(saverSmell[saverSmellIndex] <= 0)) {
+                                // Atualiza melhor cheiro encontrado nesta iteração.
+                                minSaverSmell = saverSmell[saverSmellIndex];
+                                // Atualiza coordenadas da melhor posição.
+                                minSmellPosition = new int[]{x, y};
                             }
                         }
                     }
+                    // Avança índice para próxima célula do array de olfato.
+                    saverSmellIndex++;
                 }
             }
         }
-        // PRIORIDADE 2: Se não vê Poupador, tenta rastrear pelo olfato.
-        else if (this.isTargetDetectedBySmell()) {
-            // Obtém array 3x3 com intensidades de cheiro detectadas.
-            int[] saverSmell = this.getSmellSensor();
-            // Índice atual ao iterar sobre o array de cheiro.
-            int saverSmellIndex = 0;
-            // Melhor cheiro detectado (menor valor indica mais próximo).
-            int minSaverSmell = Integer.MAX_VALUE;
-            // Coordenadas da posição com melhor cheiro.
-            int[] minSmellPosition = null;
 
-            // Procura sobre a área 3x3 de olfato ao redor da posição.
-            for (int y = thiefY - 1; y <= thiefY + 1; y++) {
-                for (int x = thiefX - 1; x <= thiefX + 1; x++) {
-                    // Pula a posição central (Ladrão não cheira a si mesmo).
-                    if (!(x == thiefX && y == thiefY)) {
-                        // Valida coordenadas dentro do labirinto.
-                        if (0 <= x && x <= 29) {
-                            if (0 <= y && y <= 29) {
-                                // Se cheiro é melhor (menor/mais forte) e válido (> 0).
-                                if (saverSmell[saverSmellIndex] <= minSaverSmell
-                                        && !(saverSmell[saverSmellIndex] <= 0)) {
-                                    // Atualiza melhor cheiro encontrado nesta iteração.
-                                    minSaverSmell = saverSmell[saverSmellIndex];
-                                    // Atualiza coordenadas da melhor posição.
-                                    minSmellPosition = new int[]{x, y};
-                                }
-                            }
-                        }
-                        // Avança índice para próxima célula do array de olfato.
-                        saverSmellIndex++;
-                    }
+        // Se encontrou cheiro, persegue direção; senão explora.
+        return minSmellPosition != null ? this.chaseTarget(minSmellPosition) : this.exploreEnvironment();
+    }
+
+    /**
+     * Verifica se há áreas desconhecidas próximas ao Ladrão.
+     * Analisa a memória em um raio maior (até 10 tiles) para determinar
+     * se há pontos de interesse para exploração.
+     *
+     * @return true se há terrenos desconhecidos próximos, false caso contrário.
+     */
+    private boolean hasUnknownAreasNearby() {
+        int[] positions = this.getCurrentPosition();
+        int thiefX = positions[0];
+        int thiefY = positions[1];
+
+        // Verifica em um raio de 10 tiles ao redor da posição
+        int searchRadius = 10;
+        for (int y = Math.max(0, thiefY - searchRadius); y <= Math.min(29, thiefY + searchRadius); y++) {
+            for (int x = Math.max(0, thiefX - searchRadius); x <= Math.min(29, thiefX + searchRadius); x++) {
+                // Se encontrar algum terreno desconhecido, há interesse em explorar
+                if (this.isTileUnknown(x, y)) {
+                    return true;
                 }
             }
-
-            // Se encontrou cheiro, persegue direção; senão explora.
-            return minSmellPosition != null ? this.chaseTarget(minSmellPosition) : this.exploreEnvironment();
         }
-        // PRIORIDADE 3: Sem visão nem olfato, explora o labirinto.
-        return this.exploreEnvironment();
+        return false;
     }
 
     /**
